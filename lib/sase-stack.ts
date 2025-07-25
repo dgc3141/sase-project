@@ -123,6 +123,16 @@ export class SaseStack extends cdk.Stack {
     });
 
     /**
+     * @description Lambda関数で使用する外部ライブラリをまとめるレイヤー。
+     * - `requests`ライブラリを含めることで、Lambda関数がHTTPリクエストを送信できるようになります。
+     */
+    const requestsLayer = new lambda.LayerVersion(this, 'RequestsLayer', {
+      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda', 'layer')), // レイヤーのコードパス
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_9], // 互換性のあるランタイム
+      description: 'Contains `requests` library',
+    });
+
+    /**
      * @description クライアントの認証処理を行うLambda関数を設定します。
      * - `runtime`: 実行環境の指定。Python 3.9を使用。
      * - `handler`: エントリポイントの関数名。
@@ -140,9 +150,11 @@ export class SaseStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')), // `lambda`ディレクトリ配下のコードをデプロイ
       vpc, // LambdaをVPC内に配置
       securityGroups: [lambdaSecurityGroup], // VPC内のリソースへのアクセスを制御するセキュリティグループ
+      layers: [requestsLayer], // requestsライブラリを含むレイヤーをアタッチ
       environment: {
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
+        // PROTECTED_API_BASE_URL は protectedApi が定義された後に設定するため、一旦Placeholder
       },
       timeout: cdk.Duration.seconds(30), // タイムアウト設定 (必要に応じて調整)
       memorySize: 128, // メモリサイズ設定 (必要に応じて調整)
@@ -386,5 +398,113 @@ export class SaseStack extends cdk.Stack {
       // `logDestinationConfigs`: ログの送信先（S3バケットのARNやCloudWatch LogsのARN）
       // `redactedFields`: ログから除外するフィールド（例: Authorization ヘッダー）
     });
+
+    /**
+     * @description ZTNAで保護されるバックエンドのLambda関数（例: ユーザー情報API）。
+     * - この関数はVPC内にデプロイされ、インターネットからは直接アクセスできません。
+     * - `memorySize`や`timeout`は、実際の処理内容に合わせて調整が必要です。
+     */
+    const protectedResourceFunction = new lambda.Function(this, 'ProtectedResourceFunction', {
+      functionName: 'sase-protected-resource-function',
+      runtime: lambda.Runtime.PYTHON_3_9,
+      handler: 'protected_resource.lambda_handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')), // `lambda`ディレクトリ配下のコードをデプロイ
+      vpc, // VPC内に配置
+      securityGroups: [lambdaSecurityGroup], // VPC内のリソースへのアクセスを制御するセキュリティグループ
+      timeout: cdk.Duration.seconds(10), // 短いタイムアウトで応答性を確保
+      memorySize: 128, // シンプルなAPIなので最小メモリで十分
+      logRetention: logs.RetentionDays.ONE_MONTH, // ログ保持期間
+    });
+
+    /**
+     * @description プライベートAPI Gatewayへのアクセスを制御するためのVPCエンドポイントを作成します。
+     * - このVPCエンドポイントは、SASEゲートウェイのLambda関数が保護されたAPIにアクセスするために使用されます。
+     */
+    const apiGatewayVpcEndpoint = new ec2.InterfaceVpcEndpoint(this, 'ApiGatewayVpcEndpoint', {
+      vpc,
+      service: ec2.InterfaceVpcEndpointAwsService.APIGATEWAY, // API Gatewayサービスのエンドポイント
+      subnets: { subnets: vpc.privateSubnets }, // プライベートサブネットに配置
+      securityGroups: [lambdaSecurityGroup], // Lambdaセキュリティグループのルールを適用
+    });
+
+    /**
+     * @description ZTNAで保護されるバックエンドAPI Gateway。
+     * - このAPI Gatewayは社内ネットワークやZTNAゲートウェイからのアクセスのみを許可します。
+     * - `endpointTypes: [apigateway.EndpointType.PRIVATE]`を設定することで、VPCエンドポイント経由でのみアクセス可能にします。
+     */
+    const protectedApi = new apigateway.RestApi(this, 'ProtectedApi', {
+      restApiName: 'sase-protected-api',
+      description: 'ZTNA Protected Backend API',
+      deployOptions: {
+        stageName: 'v1',
+        accessLogDestination: new apigateway.LogGroupLogDestination(
+          new logs.LogGroup(this, 'ProtectedApiLogGroup', {
+            logGroupName: `/aws/apigateway/${this.stackName}-ProtectedApi-AccessLogs`, // 一意のロググループ名
+            retention: logs.RetentionDays.ONE_MONTH, // ログ保持期間
+            removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け
+          })
+        ),
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields({
+          caller: true,
+          httpMethod: true,
+          ip: true,
+          protocol: true,
+          requestTime: true,
+          resourcePath: true,
+          responseLength: true,
+          status: true,
+          user: true,
+        }),
+      },
+      endpointTypes: [apigateway.EndpointType.PRIVATE], // プライベートエンドポイントのみ許可
+      policy: new iam.PolicyDocument({
+        // ベストプラクティス: リソースベースのポリシーでVPCエンドポイントまたは特定のIPからのアクセスを制限
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.DENY,
+            principals: [new iam.AnyPrincipal()],
+            actions: ['execute-api:Invoke'],
+            resources: ['execute-api:/*'],
+            conditions: {
+              StringNotEquals: {
+                'aws:SourceVpce': apiGatewayVpcEndpoint.vpcEndpointId, // 自身のVPCエンドポイントからのアクセスのみ許可
+              },
+            },
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            principals: [new iam.AnyPrincipal()], // Cognito認証済みLambdaから呼び出すため、より厳密なプリンシパルに制限すべきですが、
+                                                 // 今回はVPCエンドポイント経由でのアクセスに限定します。
+            actions: ['execute-api:Invoke'],
+            resources: ['execute-api:/*'],
+            conditions: {
+              StringEquals: {
+                'aws:SourceVpce': apiGatewayVpcEndpoint.vpcEndpointId, // SASEゲートウェイLambdaが使用するVPCエンドポイントからのアクセスのみ許可
+              },
+            },
+          }),
+        ],
+      }),
+    });
+
+    protectedApi.root.addMethod('GET', new apigateway.LambdaIntegration(protectedResourceFunction));
+
+    /**
+     * @description 認証Lambda関数に対して、保護対象のAPIへのアクセス権限を追加します。
+     * - LambdaがVPC内からプライベートAPI Gatewayを呼び出すために必要です。
+     */
+    protectedResourceFunction.addPermission('ApiGatewayInvokePermission', {
+      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      sourceArn: protectedApi.arnForExecuteApi(),
+    });
+
+    authFunction.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['execute-api:Invoke'],
+      resources: [protectedApi.arnForExecuteApi('*', '*')], // 保護対象APIのARNにinvokeを許可
+    }));
+
+    // ZTNAポリシー評価ロジックをLambdaに追加する必要があるため、
+    // `lambda/auth_function.py`も更新します。
   }
 }
