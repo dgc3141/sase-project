@@ -14,32 +14,66 @@ export class SaseStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // VPC
+    /**
+     * @description AWS ベストプラクティスに沿ったVPCを作成します。
+     * - `maxAzs`: 高可用性のために、指定された数のアベイラビリティーゾーンにサブネットを分散します。
+     * - `subnetConfiguration`: パブリックサブネットとプライベートサブネットを定義し、プライベートサブネットにはNAT Gateway経由のアウトバウンド通信を設定します。
+     */
     const vpc = new ec2.Vpc(this, 'SaseVpc', {
-      cidr: '10.0.0.0/16',
-      maxAzs: 2,
+      cidr: '10.0.0.0/16', // VPCのCIDRブロック。RFC 1918に準拠したプライベートIPアドレス範囲を使用
+      maxAzs: 2,          // VPCをデプロイするアベイラビリティーゾーンの最大数
+      flowLogs: {
+        // VPC Flow Logsを設定し、ネットワークトラフィックのモニタリングを有効化します。
+        // S3バケットへのログ保存はベストプラクティスです。
+        's3-flow-logs': {
+          destination: ec2.FlowLogDestination.toS3(new s3.Bucket(this, 'VpcFlowLogBucket', {
+            bucketName: `sase-vpc-flow-logs-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+            versioned: true,
+            encryption: s3.BucketEncryption.S3_MANAGED,
+            blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+            removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け。本番環境ではRETAIN推奨
+            autoDeleteObjects: true, // 開発環境向け。本番環境では注意
+          })),
+          trafficType: ec2.FlowLogTrafficType.ALL, // 全てのトラフィックをログに記録
+        },
+      },
       subnetConfiguration: [
         {
           cidrMask: 24,
-          name: 'public',
-          subnetType: ec2.SubnetType.PUBLIC,
+          name: 'PublicSubnet',
+          subnetType: ec2.SubnetType.PUBLIC, // インターネットからのインバウンドトラフィックを許可
         },
         {
           cidrMask: 24,
-          name: 'private',
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          name: 'PrivateWithEgressSubnet',
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, // NAT Gateway経由でインターネットへのアウトバウンドトラフィックを許可
         },
       ],
+      // `ipAddresses` プロパティの使用が推奨されています。
+      // 現在の`cidr`プロパティは非推奨となり、将来のバージョンで削除される可能性があります。
+      // 例: ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
     });
 
-    // Security Group for Lambda
+    /**
+     * @description Lambda関数用のセキュリティグループを設定します。
+     * - `allowAllOutbound`: 現状は全てのアウトバウンドを許可していますが、ベストプラクティスとしては、
+     *   必要最低限のIPアドレスやポート(例えば、CognitoやWAFへの通信)のみに制限することが推奨されます。
+     */
     const lambdaSecurityGroup = new ec2.SecurityGroup(this, 'LambdaSecurityGroup', {
       vpc,
-      description: 'Security group for Lambda functions',
-      allowAllOutbound: true,
+      description: 'Lambda関数に適用されるセキュリティグループ',
+      allowAllOutbound: true, // ベストプラクティスとしては、必要最低限のIPアドレスやポートに制限すべき
     });
 
-    // Cognito User Pool
+    /**
+     * @description クライアント認証のためのCognitoユーザープールを設定します。
+     * - `userPoolName`: ユーザープールの論理名
+     * - `selfSignUpEnabled`: ユーザー自身でのサインアップを許可するかどうか
+     * - `signInAliases`: Eメールでのサインインを許可
+     * - `autoVerify`: Eメールの自動検証を有効化
+     * - `passwordPolicy`: 強固なパスワードポリシーを適用し、セキュリティを向上させます。
+     * - `removalPolicy`: 開発環境ではDESTROYで迅速なリソース削除を、本番環境ではRETAINで誤削除防止を推奨します。
+     */
     const userPool = new cognito.UserPool(this, 'SaseUserPool', {
       userPoolName: 'sase-user-pool',
       selfSignUpEnabled: true,
@@ -47,7 +81,7 @@ export class SaseStack extends cdk.Stack {
         email: true,
       },
       autoVerify: {
-        email: true,
+        email: true, // Eメールアドレスの自動検証
       },
       passwordPolicy: {
         minLength: 8,
@@ -55,15 +89,20 @@ export class SaseStack extends cdk.Stack {
         requireUppercase: true,
         requireDigits: true,
         requireSymbols: true,
+        tempPasswordValidity: cdk.Duration.days(7), // 仮パスワードの有効期限
       },
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け
     });
 
-    // Cognito User Pool Client
+    /**
+     * @description Cognitoユーザープールクライアントを設定します。
+     * - `generateSecret`: クライアントシークレットを生成しない設定。主にフロントエンドアプリケーションからの利用を想定しています。
+     * - `authFlows`: 認証フローの定義。これにより、様々な認証方法をサポートします。
+     */
     const userPoolClient = new cognito.UserPoolClient(this, 'SaseUserPoolClient', {
       userPool,
       userPoolClientName: 'sase-client',
-      generateSecret: false,
+      generateSecret: false, // 公開クライアント (SPAなど) の場合はfalseがベストプラクティス
       authFlows: {
         adminUserPassword: true,
         custom: true,
@@ -72,7 +111,10 @@ export class SaseStack extends cdk.Stack {
       },
     });
 
-    // Cognito User Pool Domain
+    /**
+     * @description Cognitoユーザープール用のドメインを設定します。
+     * - `domainPrefix`: Cognitoホスト型UIのURLプレフィックス
+     */
     const userPoolDomain = new cognito.UserPoolDomain(this, 'SaseUserPoolDomain', {
       userPool,
       cognitoDomain: {
@@ -80,33 +122,56 @@ export class SaseStack extends cdk.Stack {
       },
     });
 
-    // Lambda Function for authentication
+    /**
+     * @description クライアントの認証処理を行うLambda関数を設定します。
+     * - `runtime`: 実行環境の指定。Python 3.9を使用。
+     * - `handler`: エントリポイントの関数名。
+     * - `code`: Lambda関数のソースコードがあるディレクトリへのパス。
+     * - `vpc` & `securityGroups` : LambdaをVPC内に配置することで、ネットワークのセキュリティを強化します。
+     * - `environment`: Lambda関数内で利用する環境変数。CognitoのIDを設定。
+     * - `timeout`: デフォルトのタイムアウトを設定。処理時間に応じて調整します。
+     * - `memorySize`: Lambda関数のメモリサイズを設定。パフォーマンスとコストに影響します。
+     * - `logRetention`: CloudWatch Logsのログ保持期間を設定。
+     */
     const authFunction = new lambda.Function(this, 'AuthFunction', {
       functionName: 'sase-auth-function',
       runtime: lambda.Runtime.PYTHON_3_9,
       handler: 'auth_function.lambda_handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')),
-      vpc,
-      securityGroups: [lambdaSecurityGroup],
+      code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')), // `lambda`ディレクトリ配下のコードをデプロイ
+      vpc, // LambdaをVPC内に配置
+      securityGroups: [lambdaSecurityGroup], // VPC内のリソースへのアクセスを制御するセキュリティグループ
       environment: {
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
       },
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(30), // タイムアウト設定 (必要に応じて調整)
+      memorySize: 128, // メモリサイズ設定 (必要に応じて調整)
+      logRetention: logs.RetentionDays.ONE_MONTH, // Lambda関数のログ保持期間
     });
 
-    // IAM Policy for Lambda to access Cognito
+    /**
+     * @description Lambda関数がCognitoユーザープールにアクセスするためのIAMポリシーを追加します。
+     * - 最小権限の原則に従い、`cognito-idp:GetUser`アクションのみを許可します。
+     */
     const lambdaCognitoPolicy = new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: [
-        'cognito-idp:GetUser',
+        'cognito-idp:GetUser', // ユーザー情報を取得するための権限
       ],
-      resources: [userPool.userPoolArn],
+      resources: [userPool.userPoolArn], // 特定のCognitoユーザープールに限定
     });
 
     authFunction.addToRolePolicy(lambdaCognitoPolicy);
 
-    // API Gateway REST API
+    /**
+     * @description SASEのセキュアWebゲートウェイ機能を提供するAPI Gateway REST APIを設定します。
+     * - `restApiName`: APIの名前。
+     * - `description`: APIの説明。
+     * - `deployOptions`:
+     *   - `stageName`: デプロイステージの名前（例: `prod`）。
+     *   - `accessLogDestination`: API GatewayのアクセスログをCloudWatch Logsに送信するように設定します。
+     *   - `accessLogFormat`: アクセスログのフォーマットをJSON形式の標準フィールドで定義します。
+     */
     const api = new apigateway.RestApi(this, 'SaseApi', {
       restApiName: 'sase-api',
       description: 'SASE Secure Web Gateway API',
@@ -114,76 +179,132 @@ export class SaseStack extends cdk.Stack {
         stageName: 'prod',
         accessLogDestination: new apigateway.LogGroupLogDestination(
           new logs.LogGroup(this, 'ApiGatewayLogGroup', {
-            logGroupName: 'API-Gateway-Execution-Logs',
-            retention: logs.RetentionDays.ONE_MONTH,
+            logGroupName: `/aws/apigateway/${this.stackName}-SaseApi-AccessLogs`, // 一意のロググループ名
+            retention: logs.RetentionDays.ONE_MONTH, // ログ保持期間
+            removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け
           })
         ),
-        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
+        // アクセスログのフォーマットをベストプラクティスに沿って詳細に設定します。
+        // これにより、トラブルシューティングや監査が容易になります。
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields({
+          caller: true,
+          httpMethod: true,
+          ip: true,
+          protocol: true,
+          requestTime: true,
+          resourcePath: true,
+          responseLength: true,
+          status: true,
+          user: true, // `user`プロパティを追加
+        }),
       },
     });
+    // APIにタグを追加することで、リソースの管理と分類が容易になります。
+    cdk.Tags.of(api).add('Project', 'SASE-Project');
+    cdk.Tags.of(api).add('ManagedBy', 'CDK');
 
-    // Cognito Authorizer
+    /**
+     * @description CognitoユーザープールをAPI Gatewayのカスタムオーソライザーとして設定します。
+     * - これにより、Cognitoで認証されたユーザーのみがAPI Gatewayにアクセスできるようになります。
+     */
     const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
-      cognitoUserPools: [userPool],
+      cognitoUserPools: [userPool], // 関連付けるCognitoユーザープール
       authorizerName: 'cognito-authorizer',
     });
 
-    // Proxy resource and method
+    /**
+     * @description API GatewayのプロキシリソースとANYメソッドを設定します。
+     * - `{proxy+}`パスで、全てのリクエストパスをキャッチします。
+     * - `LambdaIntegration`でLambda関数をバックエンドとして統合します。
+     * - `authorizationType: apigateway.AuthorizationType.COGNITO`でCognito認証を強制します。
+     */
     const proxyResource = api.root.addResource('{proxy+}');
     proxyResource.addMethod('ANY', new apigateway.LambdaIntegration(authFunction), {
-      authorizationType: apigateway.AuthorizationType.COGNITO,
+      authorizationType: apigateway.AuthorizationType.COGNITO, // Cognitoユーザープールによる認証
       authorizer: cognitoAuthorizer,
+      // メソッドに応答モデルを設定することで、APIのスキーマを定義し、クライアント側のコード生成を支援します。
+      // 現状はシンプルなプロキシのため省略していますが、本番環境では検討推奨。
     });
 
-    // Root resource method
+    /**
+     * @description API Gatewayのルートリソース (/) のANYメソッドを設定します。
+     * - プロキシリソースと同様に、Cognito認証を必須とします。
+     */
     api.root.addMethod('ANY', new apigateway.LambdaIntegration(authFunction), {
-      authorizationType: apigateway.AuthorizationType.COGNITO,
+      authorizationType: apigateway.AuthorizationType.COGNITO, // Cognitoユーザープールによる認証
       authorizer: cognitoAuthorizer,
     });
 
-    // Lambda Permission for API Gateway
+    /**
+     * @description API GatewayがLambda関数を呼び出すための権限を追加します。
+     * - 最小権限の原則に従い、特定のAPI Gatewayのみからの呼び出しを許可します。
+     */
     authFunction.addPermission('ApiGatewayPermission', {
-      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
-      sourceArn: api.arnForExecuteApi(),
+      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'), // API Gatewayからの呼び出しを許可
+      sourceArn: api.arnForExecuteApi(), // 特定のAPI Gatewayに限定
     });
 
-    // S3 Bucket for logs
+    /**
+     * @description SASEのログを保存するためのS3バケットを設定します。
+     * - `bucketName`: バケット名。一意性を保つためにアカウントIDやリージョンを組み込むことが推奨されます。
+     * - `versioned`: オブジェクトのバージョン管理を有効化し、偶発的な削除や上書きからの復旧を可能にします。
+     * - `encryption`: S3管理のSSE (Server-Side Encryption) を有効にし、保存時のデータを保護します。
+     * - `blockPublicAccess`: 全てのパブリックアクセスをブロックし、意図しないデータ漏洩を防ぎます。
+     * - `lifecycleRules`: ライフサイクルルールを設定し、古いログの自動削除を定義します。
+     * - `removalPolicy`: 開発環境ではDESTROY、本番環境ではRETAINが推奨されます。
+     * - `autoDeleteObjects`: 開発環境向け。本番環境ではfalseが一般的です。
+     */
     const logBucket = new s3.Bucket(this, 'LogBucket', {
-      bucketName: 'sase-project-logs',
-      versioned: true,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      bucketName: `sase-access-logs-${cdk.Aws.ACCOUNT_ID}`, // バケット名の一意性を確保
+      versioned: true, // バケットのバージョン管理を有効化
+      encryption: s3.BucketEncryption.S3_MANAGED, // S3管理のSSE-S3で暗号化
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // 全てのパブリックアクセスをブロック
       lifecycleRules: [
         {
-          expiration: cdk.Duration.days(30),
-          id: 'delete_after_30_days',
+          expiration: cdk.Duration.days(30), // 30日後にオブジェクトを自動削除
+          id: 'DeleteLogsAfter30Days',
           enabled: true,
+          // 特定のプレフィックスやタグを持つオブジェクトのみにルールを適用することも可能です。
+          // prefix: 'my-logs/', // 例: 特定のフォルダ内のログのみ
         },
       ],
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境ではDESTROYで迅速なリソース削除を、本番環境ではRETAINで誤削除防止を推奨
+      autoDeleteObjects: true, // 開発環境向け。本番環境では手動削除かRETAIN
     });
 
-    // CloudWatch Log Group for Lambda
+    /**
+     * @description Lambda関数のCloudWatchロググループを設定します。
+     * - `logGroupName`: ロググループ名
+     * - `retention`: ログの保持期間を設定し、コスト管理を支援します。
+     */
     new logs.LogGroup(this, 'LambdaLogGroup', {
-      logGroupName: `/aws/lambda/${authFunction.functionName}`,
-      retention: logs.RetentionDays.ONE_MONTH,
+      logGroupName: `/aws/lambda/${authFunction.functionName}`, // Lambda関数名に基づいたロググループ名
+      retention: logs.RetentionDays.ONE_MONTH, // ログ保持期間: 1ヶ月
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け
     });
 
-    // WAF Web ACL
+    /**
+     * @description API Gatewayと連携するAWS WAF Web ACLを設定します。
+     * - `scope: 'REGIONAL'` : API Gatewayのようなリージョンリソースに関連付けます。
+     * - `defaultAction`: デフォルトで許可（`allow`）とし、明示的にブロックするルールを定義します。
+     * - `rules`: AWS マネージドルールグループを適用し、一般的な脅威からの保護を簡単に実装します。
+     *   - `AWSManagedRulesCommonRuleSet`: 一般的な脆弱性に対するルール。
+     *   - `AWSManagedRulesAmazonIpReputationList`: 悪意のあるIPアドレスからのトラフィックをブロック。
+     *   - `AWSManagedRulesKnownBadInputsRuleSet`: 不正な入力パターンを検出。
+     */
     const webAcl = new wafv2.CfnWebACL(this, 'SaseWebAcl', {
       name: 'sase-web-acl',
-      description: 'Web ACL for SASE project',
-      scope: 'REGIONAL', // For regional resources like API Gateway
+      description: 'SASEプロジェクト用Web ACL',
+      scope: 'REGIONAL', // REGIONALスコープはAPI GatewayやALBに適用可能
       defaultAction: {
-        allow: {},
+        allow: {}, // デフォルトは許可し、ルールでブロックするトラフィックを定義
       },
       rules: [
         {
           name: 'AWSManagedRulesCommonRuleSet',
-          priority: 1,
+          priority: 1, // ルール評価の優先順位
           overrideAction: {
-            none: {},
+            none: {}, // マネージドルールグループのデフォルトアクションを上書きしない
           },
           statement: {
             managedRuleGroupStatement: {
@@ -194,7 +315,7 @@ export class SaseStack extends cdk.Stack {
           visibilityConfig: {
             cloudWatchMetricsEnabled: true,
             metricName: 'AWSManagedRulesCommonRuleSet',
-            sampledRequestsEnabled: true,
+            sampledRequestsEnabled: true, // サンプリングされたリクエストを有効化し、デバッグを支援
           },
         },
         {
@@ -239,12 +360,31 @@ export class SaseStack extends cdk.Stack {
         metricName: 'sase-web-acl',
         sampledRequestsEnabled: true,
       },
+      // WAFのログをS3バケットにエクスポートするように設定。
+      //これにより、詳細な分析が可能になります。
+      // LoggingConfigurationを直接CfnWebACLに含めることはできません。
+      // 別途 wafv2.CfnLoggingConfiguration リソースを使用します。
     });
 
-    // Associate WAF Web ACL with API Gateway
+    /**
+     * @description WAF Web ACLをAPI Gatewayのステージに関連付けます。
+     * - これにより、API GatewayへのリクエストがWAFによって評価・フィルタリングされます。
+     */
     new wafv2.CfnWebACLAssociation(this, 'WebAclAssociation', {
-      resourceArn: api.deploymentStage.stageArn,
-      webAclArn: webAcl.attrArn,
+      resourceArn: api.deploymentStage.stageArn, // API GatewayのデプロイステージのARN
+      webAclArn: webAcl.attrArn, // WAF Web ACLのARN
+    });
+
+    /**
+     * @description WAF Web ACLのログをS3バケットに送信するように設定します。
+     * AWS WAFのログはS3バケットまたはCloudWatch Logsに送信できます。
+     * ベストプラクティスとしては、長期保存や分析のためにS3を使用することが推奨されます。
+     */
+    new wafv2.CfnLoggingConfiguration(this, 'WebAclLoggingConfiguration', {
+      resourceArn: webAcl.attrArn,
+      logDestinationConfigs: [logBucket.bucketArn],
+      // `logDestinationConfigs`: ログの送信先（S3バケットのARNやCloudWatch LogsのARN）
+      // `redactedFields`: ログから除外するフィールド（例: Authorization ヘッダー）
     });
   }
 }
