@@ -1,0 +1,14 @@
+# Terraform
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform/
+
+# Lambda
+lambda/*.zip
+
+# Logs
+*.log
+
+# Environment variables
+.env
