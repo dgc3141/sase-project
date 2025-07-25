@@ -1,8 +1,7 @@
-# Terraform
-*.tfstate
-*.tfstate.backup
-*.tfvars
-.terraform/
+# CDK
+cdk.out/
+.cdk.local/
+node_modules/
 
 # Lambda
 lambda/*.zip

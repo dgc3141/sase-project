@@ -8,7 +8,7 @@
 graph TD
     A[クライアント] -->|HTTPS| B(API Gateway)
     B --> C{Lambda: 認証処理}
-    C -->|認証OK| D[AWS Firewall Manager]
+    C -->|認証OK| D[AWS WAF]
     C -->|認証NG| E[エラーレスポンス]
     D -->|フィルタリング| F[インターネット]
     D -->|ログ| G[S3バケット]
@@ -18,10 +18,10 @@ graph TD
 ### 主要コンポーネント
 
 1.  **API Gateway**: クライアントからのリクエストを受信し、Lambda関数に処理を委譲します。
-2.  **Lambda (認証処理)**: Cognitoと連携してクライアントの認証を行います。認証が成功した場合、リクエストをAWS Firewall Managerに転送します。
+2.  **Lambda (認証処理)**: Cognitoと連携してクライアントの認証を行います。認証が成功した場合、リクエストをAWS WAFに転送します。
 3.  **Cognito**: ユーザー認証を管理します。
-4.  **AWS Firewall Manager**: インターネットトラフィックのフィルタリングを行います。全トラフィックが対象です。
-5.  **S3バケット**: Firewall Managerのログを保存します。
+4.  **AWS WAF**: インターネットトラフィックのフィルタリングを行います。全トラフィックが対象です。
+5.  **S3バケット**: WAFのログを保存します。
 6.  **Lambda (ロギング処理)**: 必要に応じて、追加のロギング処理を行います。
 
 ### ネットワーク構成
@@ -35,64 +35,50 @@ graph TD
 2.  API GatewayがLambda関数（認証処理）を呼び出します。
 3.  Lambda関数がCognitoに認証リクエストを送信します。
 4.  Cognitoが認証結果をLambda関数に返します。
-5.  認証が成功した場合、Lambda関数がリクエストをAWS Firewall Managerに転送します。
-6.  AWS Firewall Managerがトラフィックをフィルタリングし、インターネットに転送します。
-7.  Firewall ManagerのログがS3バケットに保存されます。
+5.  認証が成功した場合、Lambda関数がリクエストをAWS WAFに転送します。
+6.  AWS WAFがトラフィックをフィルタリングし、インターネットに転送します。
+7.  WAFのログがS3バケットに保存されます。
 
 ## ディレクトリ構成
 
-*   `terraform/`: Terraform設定ファイル
+*   `cdk/`: AWS CDK設定ファイル
 *   `lambda/`: Lambda関数のソースコード
 
 ## 前提条件
 
 *   AWSアカウント
-*   Terraform CLI
+*   Node.js & npm (またはYarn)
 *   AWS CLI (認証済み)
+*   AWS CDK CLI (`npm install -g aws-cdk`)
 
-## デプロイ手順
+## デプロイ手順 (AWS CDK)
 
-1.  **Lambda関数のZIPファイル作成**:
+1.  **依存関係のインストール**:
     ```bash
-    cd lambda
-    zip -r auth_function.zip auth_function.py
-    cd ..
+    npm install
     ```
 
-2.  **Terraform初期化**:
+2.  **AWS CDK環境のブートストラップ**:
+    初回デプロイ時のみ必要です。`ACCOUNT_ID`と`AWS_REGION`を実際のAWSアカウントIDとリージョンに置き換えてください。
     ```bash
-    cd terraform
-    terraform init
+    npx cdk bootstrap aws://ACCOUNT_ID/AWS_REGION
     ```
 
-3.  **Terraformプラン**:
+3.  **CDKスタックの合成 (CloudFormationテンプレートの生成)**:
     ```bash
-    terraform plan
+    npx cdk synth
     ```
 
-4.  **Terraform適用**:
+4.  **CDKスタックのデプロイ**:
     ```bash
-    terraform apply
+    npx cdk deploy
     ```
-
-5.  **AWS Firewall Managerポリシー設定**:
-    *   AWSマネジメントコンソールにログインします。
-    *   Firewall Managerサービスに移動します。
-    *   新しいポリシーを作成し、`sase-web-acl`を関連付けます。
-    *   ポリシーのスコープを適切に設定します（例：特定のアカウント、OU全体など）。
-
-6.  **Cognitoユーザー作成**:
-    *   AWSマネジメントコンソールにログインします。
-    *   Cognitoサービスに移動します。
-    *   `sase-user-pool`にテストユーザーを作成します。
-
-7.  **API Gatewayのカスタムドメイン設定** (オプション):
-    *   必要に応じて、API Gatewayにカスタムドメインを設定します。
+    承認プロンプトが表示された場合は 'y' を入力してください。承認なしでデプロイする場合は `--require-approval never` を追加します。
 
 ## 使用方法
 
 1.  Cognitoでユーザー認証を行い、アクセストークンを取得します。
 2.  API Gatewayのエンドポイントに、`Authorization: Bearer <アクセストークン>`ヘッダーを付与してリクエストを送信します。
-3.  Lambda関数が認証を検証し、AWS Firewall Managerにトラフィックを転送します。
-4.  Firewall Managerがトラフィックをフィルタリングし、インターネットに転送します。
+3.  Lambda関数が認証を検証し、AWS WAFにトラフィックを転送します。
+4.  WAFがトラフィックをフィルタリングし、インターネットに転送します。
 5.  ログはS3バケットに保存されます。
