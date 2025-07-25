@@ -5,6 +5,7 @@ node_modules/
 
 # Lambda
 lambda/*.zip
+lambda/layer/
 
 # Logs
 *.log
