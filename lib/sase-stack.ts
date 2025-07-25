@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
+import * as s3n from 'aws-cdk-lib/aws-s3-notifications'; // S3通知用のインポートを追加
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -31,8 +32,8 @@ export class SaseStack extends cdk.Stack {
             versioned: true,
             encryption: s3.BucketEncryption.S3_MANAGED,
             blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-            removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け。本番環境ではRETAIN推奨
-            autoDeleteObjects: true, // 開発環境向け。本番環境では注意
+            removalPolicy: cdk.RemovalPolicy.RETAIN, // 本番環境向け: リソースを誤削除から保護
+            autoDeleteObjects: false, // 本番環境向け: オブジェクトの自動削除を無効化
           })),
           trafficType: ec2.FlowLogTrafficType.ALL, // 全てのトラフィックをログに記録
         },
@@ -156,8 +157,8 @@ export class SaseStack extends cdk.Stack {
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         // PROTECTED_API_BASE_URL は protectedApi が定義された後に設定するため、一旦Placeholder
       },
-      timeout: cdk.Duration.seconds(30), // タイムアウト設定 (必要に応じて調整)
-      memorySize: 128, // メモリサイズ設定 (必要に応じて調整)
+      timeout: cdk.Duration.seconds(15), // 認証機能としては通常15秒で十分
+      memorySize: 256, // パフォーマンス向上のためメモリを増量
       logRetention: logs.RetentionDays.ONE_MONTH, // Lambda関数のログ保持期間
     });
 
@@ -209,6 +210,10 @@ export class SaseStack extends cdk.Stack {
           status: true,
           user: true, // `user`プロパティを追加
         }),
+        // API Gatewayのレート制限とバーストを設定し、DoS攻撃や不正なアクセスから保護します。
+        // これはSecure Web Gatewayの重要な機能の一部です。
+        throttlingBurstLimit: 100, // 短時間で許可されるリクエストの最大数
+        throttlingRateLimit: 50,  // 1秒あたりの安定したリクエスト数
       },
     });
     // APIにタグを追加することで、リソースの管理と分類が容易になります。
@@ -280,8 +285,8 @@ export class SaseStack extends cdk.Stack {
           // prefix: 'my-logs/', // 例: 特定のフォルダ内のログのみ
         },
       ],
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境ではDESTROYで迅速なリソース削除を、本番環境ではRETAINで誤削除防止を推奨
-      autoDeleteObjects: true, // 開発環境向け。本番環境では手動削除かRETAIN
+      removalPolicy: cdk.RemovalPolicy.RETAIN, // 本番環境向け: リソースを誤削除から保護
+      autoDeleteObjects: false, // 本番環境向け: オブジェクトの自動削除を無効化
     });
 
     /**
@@ -294,6 +299,34 @@ export class SaseStack extends cdk.Stack {
       retention: logs.RetentionDays.ONE_MONTH, // ログ保持期間: 1ヶ月
       removalPolicy: cdk.RemovalPolicy.DESTROY, // 開発環境向け
     });
+
+   /**
+    * @description DLPスキャン対象のファイルを保存するためのS3バケットを設定します。
+    * - `bucketName`: バケット名。一意性を保つためにアカウントIDやリージョンを組み込むことが推奨されます。
+    * - `encryption`: S3管理のSSE (Server-Side Encryption) を有効にし、保存時のデータを保護します。
+    * - `blockPublicAccess`: 全てのパブリックアクセスをブロックし、意図しないデータ漏洩を防ぎます。
+    * - `removalPolicy`: 開発環境ではDESTROY、本番環境ではRETAINが推奨されます。
+    * - `autoDeleteObjects`: 開発環境向け。本番環境ではfalseが一般的です。
+    */
+   const dlpScanBucket = new s3.Bucket(this, 'DlpScanBucket', {
+     bucketName: `sase-dlp-scan-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`, // バケット名の一意性を確保
+     encryption: s3.BucketEncryption.S3_MANAGED, // S3管理のSSE-S3で暗号化
+     blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // 全てのパブリックアクセスをブロック
+     removalPolicy: cdk.RemovalPolicy.RETAIN, // 本番環境向け: リソースを誤削除から保護
+     autoDeleteObjects: false, // 本番環境向け: オブジェクトの自動削除を無効化
+   });
+
+   // Firewall as a Service (FWaaS) の概念導入：
+   // AWS Network Firewall を統合することで、VPC内外のトラフィックに対する
+   // 詳細なL3/L4トラフィックフィルタリングと侵入検知/防御 (IDS/IPS) 機能を提供できます。
+   // 例: new networkfirewall.CfnFirewall(...) とルールグループ
+   // これにより、SASEソリューションのネットワークセキュリティ層が強化されます。
+
+   // 集中ログ管理とデータ保護の強化：
+   // CloudFront (CDN) や Route 53 Resolver のログを中央のS3バケットに統合し、
+   // Amazon GuardDuty や AWS Security Hub と連携することで、脅威インテリジェンスと
+   // セキュリティ状態管理を強化できます。
+   // logBucket.addEventNotification や S3へのアクセスログ設定などで実現可能。
 
     /**
      * @description API Gatewayと連携するAWS WAF Web ACLを設定します。
@@ -411,10 +444,53 @@ export class SaseStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')), // `lambda`ディレクトリ配下のコードをデプロイ
       vpc, // VPC内に配置
       securityGroups: [lambdaSecurityGroup], // VPC内のリソースへのアクセスを制御するセキュリティグループ
-      timeout: cdk.Duration.seconds(10), // 短いタイムアウトで応答性を確保
+      timeout: cdk.Duration.seconds(5), // より短いタイムアウトで応答性を確保し、コストを削減
       memorySize: 128, // シンプルなAPIなので最小メモリで十分
       logRetention: logs.RetentionDays.ONE_MONTH, // ログ保持期間
     });
+
+   /**
+    * @description DLPスキャンを実行するLambda関数を設定します。
+    * - S3バケットにオブジェクトが作成されたときにトリガーされます。
+    */
+   const dlpScanFunction = new lambda.Function(this, 'DlpScanFunction', {
+     functionName: 'sase-dlp-scan-function',
+     runtime: lambda.Runtime.PYTHON_3_9,
+     handler: 'dlp_scan_function.lambda_handler',
+     code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')),
+     vpc,
+     securityGroups: [lambdaSecurityGroup],
+     timeout: cdk.Duration.seconds(60), // DLPスキャンは時間のかかる処理である可能性があるため妥当
+     memorySize: 512, // DLPスキャンの処理能力向上のためメモリを増量
+     logRetention: logs.RetentionDays.ONE_MONTH,
+   });
+
+   /**
+    * @description DLPスキャンLambda関数がS3バケットとMacieにアクセスするためのIAMポリシーを追加します。
+    * - S3バケットへの読み取り権限とMacie2へのフルアクセスを許可します。
+    */
+   dlpScanFunction.addToRolePolicy(new iam.PolicyStatement({
+     actions: ['s3:GetObject', 's3:ListBucket'],
+     resources: [
+       dlpScanBucket.bucketArn,
+       dlpScanBucket.bucketArn + '/*',
+     ],
+     effect: iam.Effect.ALLOW,
+   }));
+
+   dlpScanFunction.addToRolePolicy(new iam.PolicyStatement({
+     actions: ['macie2:*'], // Macie2サービスへの必要な権限
+     resources: ['*'], // 特定のリソースに限定することが推奨されますが、Macieのコンソール設定によっては'*'が必要な場合があります。
+     effect: iam.Effect.ALLOW,
+   }));
+
+   /**
+    * @description DLPスキャンバケットにファイルがアップロードされたときにLambda関数をトリガーするイベント通知を設定します。
+    */
+   dlpScanBucket.addEventNotification(
+     s3.EventType.OBJECT_CREATED,
+     new s3n.LambdaDestination(dlpScanFunction), // 修正: s3n.LambdaDestination を使用
+   );
 
     /**
      * @description プライベートAPI Gatewayへのアクセスを制御するためのVPCエンドポイントを作成します。
@@ -474,7 +550,7 @@ export class SaseStack extends cdk.Stack {
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
             principals: [new iam.AnyPrincipal()], // Cognito認証済みLambdaから呼び出すため、より厳密なプリンシパルに制限すべきですが、
-                                                 // 今回はVPCエンドポイント経由でのアクセスに限定します。
+                                                  // 今回はVPCエンドポイント経由でのアクセスに限定します。
             actions: ['execute-api:Invoke'],
             resources: ['execute-api:/*'],
             conditions: {
